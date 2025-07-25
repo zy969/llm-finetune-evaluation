@@ -45,7 +45,7 @@ HARD_MARGIN  = 3           # extra room for the EOS etc.
 
 
 # ----------------------------------------
-#   MODEL & TASK CONFIG
+# CONFIG
 # ----------------------------------------
 
 models = {
@@ -63,26 +63,64 @@ models = {
 
 
 tasks = {
-    "qa": {
-        "dataset": "squad",
-        "split": "validation",
-        "answer_func": lambda x: x["answers"]["text"] if x["answers"]["text"] else [""]
-    },
-    "summarization": {
-        "dataset": "cnn_dailymail",
-        "subset": "3.0.0",
-        "split": "test",
-        "answer_func": lambda x: x["highlights"]
-    },
-    "instruction": {
-        "dataset": "tatsu-lab/alpaca_eval",
-        "split": "eval",
-        "answer_func": lambda x: x["output"]
-    }
+    "qa": [
+        {
+            "name": "squad",
+            "dataset": "squad",
+            "split": "validation",
+            "answer_func": lambda x: x["answers"]["text"] if x["answers"]["text"] else [""]
+        },
+        {
+            "name": "triviaqa",
+            "dataset": "trivia_qa",
+            "subset": "rc.nocontext",
+            "split": "validation",
+            "answer_func": lambda x: [x["answer"]["value"]]
+        }
+    ],
+    "summarization": [
+        {
+            "name": "cnn",
+            "dataset": "cnn_dailymail",
+            "subset": "3.0.0",
+            "split": "test",
+            "answer_func": lambda x: x["highlights"]
+        },
+        {
+            "name": "gigaword",
+            #"dataset": "gigaword",
+            "dataset": "SpeedOfMagic/gigaword_tiny",
+            "split": "train",
+            "answer_func": lambda x: x["summary"]
+        }
+    ],
+    "instruction": [
+        {
+            "name": "alpaca",
+            "dataset": "tatsu-lab/alpaca_eval",
+            "split": "eval",
+            "answer_func": lambda x: x["output"]
+        },
+        {
+            "name": "gpteacher",
+            "dataset": "teknium/GPTeacher-General-Instruct",
+            "split": "train",
+            "answer_func": lambda x: x["response"]
+        }
+    ]
 }
 
-num_samples = {"qa": 100, "summarization": 100, "instruction": 100}
 
+num_samples = {
+    "qa_squad": 100,
+    "qa_triviaqa": 100,
+    "summarization_cnn": 100,
+    "summarization_gigaword": 100,
+    "instruction_alpaca": 100,
+    #"instruction_selfinstruct": 1,
+    "instruction_gpteacher": 100
+
+}
 
 num_runs = 5
 
@@ -92,34 +130,42 @@ cooldown_seconds = 10
 os.makedirs("llm_finetune_logs", exist_ok=True)
 
 # ----------------------------------------
-#   HELPER FUNCTIONS
+# FUNCTIONS
 # ----------------------------------------
 
 
-def build_prompt(task, sample, family, version):
+def build_prompt(task, sample, family, version, dataset_name=""):
     if task == "qa":
+        if dataset_name == "triviaqa":
+            context = sample.get("search_results", "")
+            question = sample["question"]
+        else:
+            context = sample["context"]
+            question = sample["question"]
+
         if version == "base":
             base_prompt = (
                 "Answer the following question with a short, direct phrase. Do not explain.\n"
-                f"Context: {sample['context']}\n"
-                f"Question: {sample['question']}\n"
+                f"Context: {context}\n"
+                f"Question: {question}\n"
                 "Answer:"
             )
         else:
             base_prompt = (
                 "Read the context and answer the question with a concise phrase. No extra explanation.\n"
-                f"Context: {sample['context']}\n"
-                f"Question: {sample['question']}\n"
+                f"Context: {context}\n"
+                f"Question: {question}\n"
                 "Answer:"
             )
     elif task == "summarization":
+        article_text = sample.get("article") or sample.get("document") or ""
         base_prompt = (
             "Summarize the following article into 3–5 short sentences that capture the key facts and events. "
             "Finish the summary with the token <END>.\n\n"
-            f"Article: {sample['article']}\n\nSummary:"
+            f"Article: {article_text}\n\nSummary:"
         )
     else:
-    # Alpaca-Eval
+    # Alpaca-Eval 
         input_part = sample.get("input", "")
         base_prompt = (
             "You are a helpful assistant. Follow the instruction carefully and respond concisely.\n\n"
@@ -215,7 +261,7 @@ def load_tokenizer(model_id: str):
     try:
         return AutoTokenizer.from_pretrained(
             model_id,
-            use_fast=True,        
+            use_fast=True,          
             trust_remote_code=True
         )
     except Exception as e:
@@ -223,13 +269,13 @@ def load_tokenizer(model_id: str):
               f"      —— falling back to slow tokenizer.")
         return AutoTokenizer.from_pretrained(
             model_id,
-            use_fast=False,      
+            use_fast=False,         
             trust_remote_code=True
         )
 
 
 # ----------------------------------------
-#   MAIN LOOP
+# LOOP
 # ----------------------------------------
 start_time = datetime.now()
 log(f"===== Experiment started at {start_time.strftime('%Y-%m-%d %H:%M:%S')} =====")
@@ -241,246 +287,226 @@ selected_tasks = ["instruction","qa", "summarization"]
 
 
 for task in selected_tasks:
-    cfg = tasks[task]    
+    for cfg in tasks[task]:
+        task_name = f"{task}_{cfg['name']}"
+        log(f"\n===== Loading dataset for task: {task_name.upper()} =====")
 
-    log(f"\n===== Loading dataset for task: {task.upper()} =====")
-    download_cfg = DownloadConfig(resume_download=True, max_retries=10)
+        download_cfg = DownloadConfig(resume_download=True, max_retries=10)
 
-    dset = load_dataset(cfg["dataset"], cfg.get("subset"), split=cfg["split"],
-                        download_config=download_cfg, verification_mode="no_checks")
-    dset = dset.shuffle(seed=42).select(range(num_samples[task]))
-    log(f"Dataset loaded: {len(dset)} samples.")
+        try:
+            dset = load_dataset(
+                path=cfg["dataset"],
+                name=cfg.get("subset", None),  
+                split=cfg["split"],
+                download_config=download_cfg,
+                verification_mode="no_checks"
+            )
+        except Exception as e:
+            log(f"[ERROR] Failed to load dataset {task_name}: {e}")
+            continue
 
-    for family, pair in models.items():
-        priority = {"lora": 0, "full": 1, "base": 2}
-        sorted_items = sorted(pair.items(), key=lambda x: priority.get(x[0], 99))
-        for version, model_id in sorted_items:
-            for run in range(1, num_runs + 1):
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()  
-                header = f"[{task.upper()}] {family}-{version}  Run {run}/{num_runs}"
-                log("=" * len(header))
-                log(header)
-                log("=" * len(header))
+        if len(dset) == 0:
+            log(f"[WARN] Dataset {task_name} is empty. Skipping.")
+            continue
 
-                log_file = f"llm_finetune_logs/{task}_{family}_{version}_run{run}.json"
-                if os.path.exists(log_file):
-                    log(f"[SKIP] {log_file} already exists, skip this run.")
-                    continue
+        dset = dset.shuffle(seed=42).select(range(num_samples.get(task_name, 100)))
+        log(f"Dataset loaded: {len(dset)} samples.")
 
-                try:
+
+        for family, pair in models.items():
+            priority = {"lora": 0, "full": 1, "base": 2}
+            sorted_items = sorted(pair.items(), key=lambda x: priority.get(x[0], 99))
+            for version, model_id in sorted_items:
+                for run in range(1, num_runs + 1):
                     torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
 
-                    if version == "lora":
-                        lora_path = pair["lora"]
-                        base_id = pair["base"] 
-                        tokenizer = load_tokenizer(base_id)
+                    header = f"[{task_name.upper()}] {family}-{version}  Run {run}/{num_runs}"
+                    log("=" * len(header))
+                    log(header)
+                    log("=" * len(header))
 
-                        bnb_config = BitsAndBytesConfig(   
-                            load_in_4bit=True,
-                            bnb_4bit_quant_type="nf4",
-                            bnb_4bit_use_double_quant=True,
-                            bnb_4bit_compute_dtype=torch.bfloat16,
-                        )
+                    log_file = f"llm_finetune_logs/{task_name}_{family}_{version}_run{run}.json"
+                    if os.path.exists(log_file):
+                        log(f"[SKIP] {log_file} already exists, skip this run.")
+                        continue
 
-                        
-                        model = AutoModelForCausalLM.from_pretrained(
-                           lora_path, torch_dtype=torch.float16, device_map="auto",quantization_config=bnb_config
-                        )
-
-                     
-                        model.eval()
-                        
-                        
-
-
-
-                      
-                    else:
-                        tokenizer = load_tokenizer(model_id)
-                        model = AutoModelForCausalLM.from_pretrained(
-                            model_id, torch_dtype=torch.float16
-                        ).to("cuda:0")
-
-                    model.eval()
-
-
-                except Exception as e:
-                    log(f"[ERROR] Failed to load model {model_id}: {e}")
-                    raise SystemExit(f"[ABORTED] Stopping entire run due to model loading failure.")
-
-                results = {
-                    "model": model_id,
-                    "version": version,
-                    "task": task,
-                    "run": run,
-                    "latencies": [],
-                    "gpu_memories": [],
-                    "cpu_usages": [],
-                    "predictions": [],
-                    "references": [],
-                    "output_lengths": [],
-                    "instructions": [],
-                    "inputs": [],                
-                }
-
-                budget = TOKEN_BUDGET[task] + HARD_MARGIN 
-                results["max_tokens"]  = budget
-                results["decoding"]    = "top_p 0.9 / temp 0.7"
-                results["temperature"] = 0.7               
-
-
-                for idx, sample in enumerate(tqdm(dset, desc=f"{task}-{version}-Run{run}"), 1):
-
-                    prompt = build_prompt(task, sample, family, version)
-
-                    if task == "qa":
-                        ref_answer = cfg["answer_func"](sample)         
-                    else:
-                        ref_answer = str(cfg["answer_func"](sample))   
                     try:
-                        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-                        prompt_len = inputs["input_ids"].shape[1]
-                        max_length = getattr(model.config, "max_position_embeddings", None)
-                        if max_length and prompt_len > max_length:
-                            log(f"[SKIP] {task}-{version}-Run{run} Sample {idx}: prompt length {prompt_len} > limit ({max_length})")
-                            continue
-
-
-
-                        
-                        if task == "instruction":
-                            results["instructions"].append(sample["instruction"])
-                            results["inputs"].append(sample.get("input", ""))
-                        else:
-                            results["instructions"].append("")
-                            results["inputs"].append("")
-
                         torch.cuda.empty_cache()
-                        start = time.time()
-                        cpu_before = psutil.cpu_percent(interval=None)
 
-                 
-                        with torch.no_grad():
-                            # hard limit 
-                            budget = TOKEN_BUDGET[task] + HARD_MARGIN
-                          
-                            eos_ids = [2 if version == "lora" else tokenizer.eos_token_id]
+                        if version == "lora":
+                            lora_path = pair["lora"]
+                            base_id = pair["base"]
+                            tokenizer = load_tokenizer(base_id)
 
-                            if task == "summarization":   
-                                end_id = tokenizer.convert_tokens_to_ids("<END>")
-                                if end_id not in {None, tokenizer.unk_token_id}:
-                                    eos_ids.append(end_id)
-
-                            
-                            gen_ids = model.generate(
-                                **inputs,
-                                max_new_tokens = budget,
-                                do_sample=True,
-                                temperature    = 0.7,
-                                top_p          = 0.9,
-                                eos_token_id   = eos_ids,
-                                early_stopping=True,
-                                pad_token_id   = tokenizer.eos_token_id
+                            bnb_config = BitsAndBytesConfig(
+                                load_in_4bit=True,
+                                bnb_4bit_quant_type="nf4",
+                                bnb_4bit_use_double_quant=True,
+                                bnb_4bit_compute_dtype=torch.bfloat16,
                             )
 
-                        end = time.time()
-                        cpu_after = psutil.cpu_percent(interval=None)
-                        cpu_usage = (cpu_before + cpu_after) / 2
-
-                        gen_text = tokenizer.decode(gen_ids[0][prompt_len:], skip_special_tokens=True)
-                        gen_text = gen_text.replace('<|user|>', '').replace('<|assistant|>', '').strip()
-                        if task == "summarization":
-                            generated = gen_text.replace("<END>", "").strip()
+                            model = AutoModelForCausalLM.from_pretrained(
+                                lora_path, torch_dtype=torch.float16, device_map="auto", quantization_config=bnb_config
+                            )
                         else:
-                            generated = gen_text.strip()
-                        gen_length = gen_ids[0].shape[0] - prompt_len
-                        results.setdefault("output_lengths", []).append(gen_length)
+                            tokenizer = load_tokenizer(model_id)
+                            model = AutoModelForCausalLM.from_pretrained(
+                                model_id, torch_dtype=torch.float16
+                            ).to("cuda:0")
 
-                        print(f"[DEBUG] {task}-{version} #{idx}: {gen_length:>3}/{budget} tokens  →  {generated[:80]!r}")
+                        model.eval()
+                    except Exception as e:
+                        log(f"[ERROR] Failed to load model {model_id}: {e}")
+                        raise SystemExit(f"[ABORTED] Stopping entire run due to model loading failure.")
 
+                    results = {
+                        "model": model_id,
+                        "version": version,
+                        "task": task_name,
+                        "run": run,
+                        "latencies": [],
+                        "gpu_memories": [],
+                        "cpu_usages": [],
+                        "predictions": [],
+                        "references": [],
+                        "output_lengths": [],
+                        "instructions": [],
+                        "inputs": [],
+                    }
 
-                    except Exception as ie:
-                        log(f"[WARN] Inference error: {ie}")
-                        generated = ""
-                        end = start = time.time()
-                        cpu_usage = 0
+                    budget = TOKEN_BUDGET[task] + HARD_MARGIN
+                    results["max_tokens"] = budget
+                    results["decoding"] = "top_p 0.9 / temp 0.7"
+                    results["temperature"] = 0.7
 
-                    results["latencies"].append(end - start)
-                    results["gpu_memories"].append(get_gpu_memory())
-                    results["cpu_usages"].append(cpu_usage)
-                    results["predictions"].append(generated)
-                    results["references"].append(ref_answer)
+                    for idx, sample in enumerate(tqdm(dset, desc=f"{task_name}-{version}-Run{run}"), 1):
+                        prompt = build_prompt(task, sample, family, version, dataset_name=cfg["name"])
 
-                results["latency_avg"] = mean(results["latencies"])
-                results["gpu_peak_mb"] = max(results["gpu_memories"])
-                results["cpu_avg"] = mean(results["cpu_usages"])
+                        ref_answer = cfg["answer_func"](sample)
+                        if task != "qa":
+                            ref_answer = str(ref_answer)
 
-                try:
-                    if not results["predictions"] or not results["references"]:
-                        log("[WARN] No predictions or references collected; skipping evaluation.")
-                        metrics = {"exact_match": None, "f1": None, "rouge1": None, "rougeL": None}
-                    else:
-                        if task == "qa":
-                            metrics = evaluate_qa(results["predictions"], results["references"])
-                        elif task == "summarization":
-                            metrics = evaluate_summ(results["predictions"], results["references"])
+                        try:
+                            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                            prompt_len = inputs["input_ids"].shape[1]
+                            max_length = getattr(model.config, "max_position_embeddings", None)
+                            if max_length and prompt_len > max_length:
+                                log(f"[SKIP] {task_name}-{version}-Run{run} Sample {idx}: prompt too long ({prompt_len})")
+                                continue
+
+                            if task == "instruction":
+                                results["instructions"].append(sample["instruction"])
+                                results["inputs"].append(sample.get("input", ""))
+                            else:
+                                results["instructions"].append("")
+                                results["inputs"].append("")
+
+                            start = time.time()
+                            cpu_before = psutil.cpu_percent(interval=None)
+
+                            with torch.no_grad():
+                                eos_ids = [2 if version == "lora" else tokenizer.eos_token_id]
+                                if task == "summarization":
+                                    end_id = tokenizer.convert_tokens_to_ids("<END>")
+                                    if end_id not in {None, tokenizer.unk_token_id}:
+                                        eos_ids.append(end_id)
+
+                                gen_ids = model.generate(
+                                    **inputs,
+                                    max_new_tokens=budget,
+                                    do_sample=True,
+                                    temperature=0.7,
+                                    top_p=0.9,
+                                    eos_token_id=eos_ids,
+                                    early_stopping=True,
+                                    pad_token_id=tokenizer.eos_token_id
+                                )
+
+                            end = time.time()
+                            cpu_after = psutil.cpu_percent(interval=None)
+                            cpu_usage = (cpu_before + cpu_after) / 2
+
+                            gen_text = tokenizer.decode(gen_ids[0][prompt_len:], skip_special_tokens=True)
+                            gen_text = gen_text.replace('<|user|>', '').replace('<|assistant|>', '').strip()
+                            if task == "summarization":
+                                generated = gen_text.replace("<END>", "").strip()
+                            else:
+                                generated = gen_text.strip()
+                            print("[MODEL OUTPUT]", generated)
+
+                            gen_length = gen_ids[0].shape[0] - prompt_len
+                        except Exception as ie:
+                            log(f"[WARN] Inference error: {ie}")
+                            generated = ""
+                            end = start = time.time()
+                            cpu_usage = 0
+                            gen_length = 0
+
+                        results["latencies"].append(end - start)
+                        results["gpu_memories"].append(get_gpu_memory())
+                        results["cpu_usages"].append(cpu_usage)
+                        results["predictions"].append(generated)
+                        results["references"].append(ref_answer)
+                        results["output_lengths"].append(gen_length)
+
+                    results["latency_avg"] = mean(results["latencies"])
+                    results["gpu_peak_mb"] = max(results["gpu_memories"])
+                    results["cpu_avg"] = mean(results["cpu_usages"])
+
+                    try:
+                        if not results["predictions"] or not results["references"]:
+                            metrics = {"exact_match": None, "f1": None, "rouge1": None, "rougeL": None}
                         else:
-                            metrics = {}
-                    results.update(metrics)
-                    if task == "summarization" and metrics:
-                        log(f"[ROUGE]  R1={metrics.get('rouge1'):.4f}  "
-                            f"RL={metrics.get('rougeL'):.4f}  "
-                            f"RLSum={metrics.get('rougeLsum'):.4f}")
+                            if task == "qa":
+                                metrics = evaluate_qa(results["predictions"], results["references"])
+                            elif task == "summarization":
+                                metrics = evaluate_summ(results["predictions"], results["references"])
+                            else:
+                                metrics = {}
+                        results.update(metrics)
+                    except Exception as ev:
+                        log(f"[WARN] Evaluation failed: {ev}")
 
-                except Exception as ev:
-                    log(f"[WARN] Evaluation failed: {ev}")
+                    with open(log_file, "w") as f:
+                        json.dump(results, f, indent=2)
+                    log(f"[SAVED] Results written to {log_file}")
 
+                    csv_file = log_file.replace(".json", ".csv")
+                    df = pd.DataFrame({
+                        "task": [task_name] * len(results["predictions"]),
+                        "model_family": [family] * len(results["predictions"]),
+                        "version": [version] * len(results["predictions"]),
+                        "run": [run] * len(results["predictions"]),
+                        "latency": results["latencies"],
+                        "gpu_memory": results["gpu_memories"],
+                        "cpu_usage": results["cpu_usages"],
+                        "prediction": results["predictions"],
+                        "reference": results["references"],
+                        "instruction": results["instructions"],
+                        "input": results["inputs"],
+                        "exact_match": [results.get("exact_match", None)] * len(results["predictions"]),
+                        "f1": [results.get("f1", None)] * len(results["predictions"]),
+                        "rouge1": [results.get("rouge1", None)] * len(results["predictions"]),
+                        "rougeL": [results.get("rougeL", None)] * len(results["predictions"]),
+                        "rougeLsum": [results.get("rougeLsum", None)] * len(results["predictions"]),
+                        "output_length": results["output_lengths"],
+                        "max_tokens": [results["max_tokens"]] * len(results["predictions"]),
+                        "decoding": [results["decoding"]] * len(results["predictions"]),
+                        "temperature": [results["temperature"]] * len(results["predictions"]),
+                    })
 
-                with open(log_file, "w") as f:
-                    json.dump(results, f, indent=2)
-                log(f"[SAVED] Results written to {log_file}")
-                
+                    df.to_csv(csv_file, index=False)
+                    log(f"[SAVED] CSV written to {csv_file}")
 
-                csv_file = log_file.replace(".json", ".csv")
-                df = pd.DataFrame({
-                    "task": [task] * len(results["predictions"]),
-                    "model_family": [family] * len(results["predictions"]),
-                    "version": [version] * len(results["predictions"]),
-                    "run": [run] * len(results["predictions"]),
-                    "latency": results["latencies"],
-                    "gpu_memory": results["gpu_memories"],
-                    "cpu_usage": results["cpu_usages"],
-                    "prediction": results["predictions"],
-                    "reference": results["references"],
-                    "instruction":   results["instructions"],
-                    "input":   results["inputs"],
-                    "exact_match": [results.get("exact_match", None)] * len(results["predictions"]),
-                    "f1": [results.get("f1", None)] * len(results["predictions"]),
-                    "rouge1": [results.get("rouge1", None)] * len(results["predictions"]),
-                    "rougeL": [results.get("rougeL", None)] * len(results["predictions"]),
-                    "rougeLsum": [results.get("rougeLsum", None)] * len(results["predictions"]),
+                    model.to("cpu")
+                    del model
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    time.sleep(cooldown_seconds)
+                    log("[INFO] Cooldown complete.\n")
 
-                    "output_length": results["output_lengths"],
-                    "max_tokens": [results["max_tokens"]] * len(results["predictions"]),
-                    "decoding": [results["decoding"]] * len(results["predictions"]),
-                    "temperature": [results["temperature"]] * len(results["predictions"]),
-
-                })
-
-
-                df.to_csv(csv_file, index=False)
-                log(f"[SAVED] CSV written to {csv_file}")
-
-
-
-                model.to("cpu")
-                del model
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
-                time.sleep(cooldown_seconds)
-                log("[INFO] Cooldown complete.\n")
 
 
 end_time = datetime.now()
