@@ -2,7 +2,7 @@
 Statistical analysis script for LLM fine-tuning evaluation metrics.
 
 Performs normality testing, ANOVA or non-parametric tests (Friedman, Wilcoxon),
-and computes effect sizes (Cohen's d) across model versions on various tasks.
+and computes effect sizes across model versions on various tasks.
 """
 import pandas as pd
 import numpy as np
@@ -115,8 +115,8 @@ def analyze_metric(df_task, metric):
         for idx, (pair, p_corr) in enumerate(zip(comparisons, pvals_corr)):
             print(f"[Wilcoxon] {pair[0]} vs {pair[1]}: corrected p = {p_corr:.4f}")
 
-    # Effect size (Cohen's d)
-    print("\n[Effect Size] Cohen's d (pooled std):")
+        # Effect size (Glass's Δ using base model as reference std)
+    print("\n[Effect Size] Glass's Δ (using first model as reference std):")
     for i in range(len(pivot_df.columns)):
         for j in range(i + 1, len(pivot_df.columns)):
             m1, m2 = pivot_df.columns[i], pivot_df.columns[j]
@@ -130,17 +130,17 @@ def analyze_metric(df_task, metric):
             mean_x = np.mean(x)
             mean_y = np.mean(y)
             diff = mean_x - mean_y
-            std_x = np.std(x, ddof=1)
-            std_y = np.std(y, ddof=1)
-            pooled_std = np.sqrt((std_x**2 + std_y**2) / 2)
+            std_ref = np.std(x, ddof=1)
+            std_ref = max(std_ref, 1e-2)  # avoid division by near-zero
 
             print(f"  {m1} vs {m2}: mean_x = {mean_x:.4f}, mean_y = {mean_y:.4f}, Δ = {diff:.4f}")
-            if pooled_std < 1e-6 or abs(diff) < 1e-3:
-                print(f" Skipped: negligible difference or variance (Δμ < 1e-3 or σ_pooled < 1e-6)")
+            if std_ref < 1e-6 or abs(diff) < 1e-3:
+                print(f" Skipped: negligible difference or variance (Δμ < 1e-3 or σ_ref < 1e-6)")
                 continue
 
-            d = diff / pooled_std
-            print(f" Cohen's d = {d:.3f}")
+            delta = diff / std_ref
+            print(f" Glass's Δ = {delta:.3f}")
+
 
 for task, metrics in metrics_per_task.items():
     df_task = df[df["task"] == task]
