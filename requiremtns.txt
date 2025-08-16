@@ -1,0 +1,11 @@
+pandas
+numpy
+scipy
+statsmodels
+matplotlib
+tiktoken
+openai
+peft
+psutil
+datasets
+transformers
