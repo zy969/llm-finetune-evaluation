@@ -11,7 +11,6 @@ Task-oriented evaluation of LLaMA-2-7B under three adaptation strategies:
 - Instruction Following (AlpacaEval, GPTeacher)  
 
 ### Methods
-- Controlled experiments on identical hardware (RTX 3090, 24GB)  
 - Metrics: EM/F1 (QA), ROUGE (summarization), GPT-4 preference (instruction following)  
 - Statistical analysis: ANOVA, Wilcoxon tests, effect sizes  
 
